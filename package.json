@@ -1,0 +1,33 @@
+{
+  "name": "rasterklang-score",
+  "version": "0.1.0",
+  "description": "Pattern engine, compiler and exporters turning rasterklang songs into C64 SID register writes (research project)",
+  "license": "MIT",
+  "author": "Daniel Nögel",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dnoegel/rasterklang-score.git"
+  },
+  "homepage": "https://github.com/dnoegel/rasterklang-score#readme",
+  "type": "module",
+  "main": "src/compiler/song.js",
+  "exports": {
+    "./pattern/*": "./src/pattern/*",
+    "./compiler/*": "./src/compiler/*",
+    "./engine/*": "./src/engine/*",
+    "./export/*": "./src/export/*"
+  },
+  "files": [
+    "src/"
+  ],
+  "scripts": {
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "rasterklang-dsl": "^0.1.0"
+  },
+  "devDependencies": {
+    "rasterklang-dsl": "file:../rasterklang-dsl",
+    "vitest": "^3.0.0"
+  }
+}
