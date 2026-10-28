@@ -501,7 +501,9 @@ export function compile(song) {
       const slideToActive = activeNotes.length === 1 && activeNotes[0].slideTo === true && isNewNote;
       const suppressOnset = toneportaLegato || gateLegato || slideToActive;
       const isOnset = isNewNote && !suppressOnset;
-      if (suppressOnset) runtime.framesSinceOnset += 1;
+      // A rest keeps the table clock running: the last note's instrument
+      // releases through its own tables, as in a tracker (see `inst` below).
+      if (suppressOnset || activeKey === null) runtime.framesSinceOnset += 1;
       else runtime.framesSinceOnset = activeKey === runtime.activeKey ? runtime.framesSinceOnset + 1 : 0;
       runtime.activeKey = activeKey;
 
@@ -577,7 +579,11 @@ export function compile(song) {
             runtime.activeInstrumentSourceEnd = null;
           }
         }
-        inst = activeKey !== null ? runtime.activeInstrument : null;
+        // In a rest the last instrument stays (its tables run on while the
+        // envelope releases, as in a tracker). Dropping it fell back to the
+        // chain's waveform, triangle by default, at the last frequency: a
+        // noise drum at a high fixed pitch rang on as a beep.
+        inst = runtime.activeInstrument ?? null;
         if (activeKey !== null) {
           instSourceStart = runtime.activeInstrumentSourceStart;
           instSourceEnd = runtime.activeInstrumentSourceEnd;
