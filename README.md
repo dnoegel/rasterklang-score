@@ -24,6 +24,8 @@ emulator or a real chip plays.
 - **`src/engine/`**: live playback and low-latency note audition on top of a
   WebAssembly SID emulator (the emulator itself is not part of this
   package).
+  `engine/iosAudio.js` makes that playback audible on iPhones with the
+  silent switch on and after autoplay or call interruptions.
 - **`src/export/`**: `.sid` (PSID v2 with a register-dump replay routine) and
   `.wav` export.
 

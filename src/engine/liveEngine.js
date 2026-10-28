@@ -19,6 +19,22 @@ const DEFAULT_FRAMES_PER_BUFFER = 6; // ~120ms per scheduled AudioBuffer at 50fp
 const DEFAULT_SCHEDULE_AHEAD_SECONDS = 0.6;
 const DEFAULT_SCHEDULE_INTERVAL_MS = 75;
 
+// Locked screens / hidden tabs: browsers (a locked iPhone in particular)
+// throttle the main-thread timer that drives the pump loop, so a 0.6 s
+// queue runs dry between ticks and the sound stutters. scheduleAheadHiddenSeconds
+// is the lookahead used while document.visibilityState is 'hidden'; it
+// defaults to scheduleAheadSeconds (off), because a long queue delays
+// setFrameSource() hot-swaps by up to that long. Players of finished songs
+// pass a few seconds (e.g. 8). A tick never renders more than the time that
+// passed since the previous tick plus CATCH_UP_SECONDS, so the queue grows
+// towards the hidden lookahead even when ticks arrive late, without one
+// long main-thread block when the page hides.
+const CATCH_UP_SECONDS = 1.5;
+
+// Seconds of audio after the last song frame that still count as the song
+// (release tails), see start()'s endFrame option.
+const DEFAULT_END_TAIL_SECONDS = 0.7;
+
 // Low-latency "audition" scheduling profile - a SEPARATE preset from the
 // DEFAULT_* constants above, which stay large on purpose for glitch-free
 // SEQUENCED song playback (large lookahead absorbs scheduling jitter at the
@@ -244,6 +260,7 @@ export async function createLiveEngine({
   framesPerBuffer = DEFAULT_FRAMES_PER_BUFFER,
   scheduleAheadSeconds = DEFAULT_SCHEDULE_AHEAD_SECONDS,
   scheduleIntervalMs = DEFAULT_SCHEDULE_INTERVAL_MS,
+  scheduleAheadHiddenSeconds = scheduleAheadSeconds,
   wasmJsURL = DEFAULT_WASM_JS_URL,
   wasmExecURL = DEFAULT_WASM_EXEC_URL,
   wasmURL = DEFAULT_WASM_URL,
@@ -269,9 +286,29 @@ export async function createLiveEngine({
   let frameSource = null;
   let frameIndex = 0;
   let scheduledTime = 0;
+  let startedAt = 0;
+  let lastTick = 0;
   let running = false;
   let timerId = null;
   const activeSources = new Set();
+
+  // start()'s endFrame/onEnded: endsAt is the audioContext time at which
+  // endFrame plus the release tail has been heard, known once the batch
+  // containing endFrame is scheduled.
+  let endFrame = null;
+  let endTailSeconds = DEFAULT_END_TAIL_SECONDS;
+  let onEnded = null;
+  let endsAt = null;
+
+  const hasDocument = typeof document !== 'undefined';
+  const isHidden = () => hasDocument && document.visibilityState === 'hidden';
+  if (hasDocument && scheduleAheadHiddenSeconds > scheduleAheadSeconds) {
+    // Fill the long queue right away when the screen locks, before the
+    // throttled timer fires.
+    document.addEventListener('visibilitychange', () => {
+      if (running && isHidden()) pump();
+    });
+  }
 
   // now-playing timeline: {audibleAt, lastFrame}[], time-ordered, one entry
   // per rendered frame, tagged with the audioContext time its audio is
@@ -302,9 +339,25 @@ export async function createLiveEngine({
   }
 
   function pump() {
+    if (timerId !== null) {
+      clearTimeout(timerId);
+      timerId = null;
+    }
     if (!running) return;
+    const now = audioContext.currentTime;
+    if (endsAt !== null && now >= endsAt) {
+      const ended = onEnded;
+      stopScheduling();
+      nowPlayingTimeline = [];
+      if (ended) ended();
+      return;
+    }
+    const ahead = isHidden() ? scheduleAheadHiddenSeconds : scheduleAheadSeconds;
+    const target = Math.min(now + ahead, scheduledTime + (now - lastTick) + CATCH_UP_SECONDS);
+    lastTick = now;
     try {
-      while (scheduledTime < audioContext.currentTime + scheduleAheadSeconds) {
+      while (scheduledTime < target) {
+        const firstFrame = frameIndex;
         const { data, nextFrameIndex, frameSnapshots } = renderFrameBatch({
           frameSource,
           session,
@@ -329,6 +382,10 @@ export async function createLiveEngine({
         const startAt = Math.max(scheduledTime, audioContext.currentTime + 0.01);
         source.start(startAt);
         activeSources.add(source);
+
+        if (endFrame !== null && endsAt === null && nextFrameIndex > endFrame) {
+          endsAt = startAt + ((endFrame - firstFrame) * samplesPerFrame) / actualSampleRate + endTailSeconds;
+        }
 
         // Tag each snapshot with the wall-clock (audioContext) time its
         // frame's audio actually starts playing - frame f within this batch
@@ -360,14 +417,27 @@ export async function createLiveEngine({
 
     // Starts (or restarts) playback with the given frameSource. frameIndex
     // resets to 0 and then increases monotonically for this run.
-    async start(newFrameSource) {
+    //
+    // For a song of known length pass endFrame (the number of song frames)
+    // and onEnded: the engine keeps calling frameSource past endFrame (it
+    // should return silence or gate-offs there) until endFrame plus
+    // endTailSeconds has actually been heard, then stops and calls
+    // onEnded(). The end is taken from the audio clock, not a timer, so it
+    // stays right with a long hidden-page queue.
+    async start(newFrameSource, options = {}) {
       stopScheduling();
       frameSource = newFrameSource || null;
       frameIndex = 0;
       nowPlayingTimeline = [];
+      endFrame = options.endFrame ?? null;
+      endTailSeconds = options.endTailSeconds ?? DEFAULT_END_TAIL_SECONDS;
+      onEnded = options.onEnded ?? null;
+      endsAt = null;
       await audioContext.resume();
       running = true;
       scheduledTime = audioContext.currentTime + 0.06;
+      startedAt = scheduledTime;
+      lastTick = audioContext.currentTime;
       pump();
     },
 
@@ -410,6 +480,11 @@ export async function createLiveEngine({
 
     get frameIndex() {
       return frameIndex;
+    },
+
+    // audioContext time at which frame 0 of the current run starts playing.
+    get startedAt() {
+      return startedAt;
     },
   };
 }
