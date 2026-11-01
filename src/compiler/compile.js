@@ -180,6 +180,29 @@ function resolveVoiceAssignments(rawVoices) {
 
 export const DEFAULT_MASTER_VOLUME = 15;
 
+// nextNote(chain, cycleIndex, hap) -> { follows, legato } for what starts
+// right where `hap` ends (possibly in the next cycle). `follows`: a note (ADR
+// 0005 D4: a hard restart only rewrites the envelope before another note, as
+// GoatTracker's does). `legato` (ADR 0006 D2): that note is entered without
+// a retrigger, by a tie, a slideTo tag or an fx tone portamento.
+function nextNote(chain, cycleIndex, hap) {
+  let pos = hap.startFrac + hap.durFrac;
+  let cycle = cycleIndex;
+  while (pos >= 1 - 1e-9) {
+    pos -= 1;
+    cycle += 1;
+  }
+  pos = Math.max(0, pos) + 1e-9;
+  const next = activeHapsAt(chain.notePattern, cycle, pos);
+  if (next.length === 0) return { follows: false, legato: false };
+  let legato = next.some((h) => h.tie === true || h.slideTo === true);
+  if (!legato && chain.effectPattern) {
+    const fxNext = activeHapsAt(chain.effectPattern, cycle, pos);
+    legato = fxNext.length > 0 && fxNext[0].value != null && fxNext[0].value.op === 'tp';
+  }
+  return { follows: true, legato };
+}
+
 // sampleTable(table, framesSinceOnset, loopIndex, speed, delay) -> the table
 // entry active `framesSinceOnset` frames after this voice's current note
 // onset. Used for the instrument wave/arp/pw/filterTable/test/gate tables
@@ -251,6 +274,11 @@ function makeCycleClock(song) {
     return Math.round((framesPerMinute / bpm) * beatsPerCycle);
   }
 
+  // ADR 0005 D5 (rasterklang-dsl's `speed N groove M`): beats of unequal
+  // frame counts, cycled from the song's first beat. Notes keep their bar
+  // position; only the frame mapping inside a bar becomes piecewise linear.
+  if (song.grooveFrames) return makeGrooveClock(song.grooveFrames, beatsPerCycle);
+
   if (!song.tempoPattern) {
     const framesPerCycle = framesPerCycleForBpm(song.tempoBPM);
     return function resolve(shiftedFrame) {
@@ -288,6 +316,50 @@ function makeCycleClock(song) {
       framesPerCycle = framesPerCycleForBpm(bpmForCycle(cycleIndex));
     }
     const posFrac = (shiftedFrame - cycleStart) / framesPerCycle;
+    return { cycleIndex, posFrac, framesPerCycle };
+  };
+}
+
+// makeGrooveClock(grooveFrames, beatsPerCycle) -> the same resolve() shape
+// as makeCycleClock's, for a song whose beat k lasts
+// grooveFrames[k % grooveFrames.length] frames. Walks one cycle at a time
+// from a running anchor, like the tempo-pattern clock, because a bar of an
+// odd number of beats alternates between two lengths.
+function makeGrooveClock(grooveFrames, beatsPerCycle) {
+  const beats = Math.max(1, Math.round(beatsPerCycle) || 1);
+  const len = grooveFrames.length;
+  const beatFrames = (k) => grooveFrames[((k % len) + len) % len];
+  const framesOfCycle = (c) => {
+    let sum = 0;
+    for (let b = 0; b < beats; b += 1) sum += beatFrames(c * beats + b);
+    return sum;
+  };
+
+  let cycleIndex = 0;
+  let cycleStart = 0;
+  let framesPerCycle = framesOfCycle(0);
+
+  return function resolve(shiftedFrame) {
+    while (shiftedFrame < cycleStart) {
+      cycleIndex -= 1;
+      framesPerCycle = framesOfCycle(cycleIndex);
+      cycleStart -= framesPerCycle;
+    }
+    while (shiftedFrame >= cycleStart + framesPerCycle) {
+      cycleStart += framesPerCycle;
+      cycleIndex += 1;
+      framesPerCycle = framesOfCycle(cycleIndex);
+    }
+    let offset = shiftedFrame - cycleStart;
+    let posFrac = 0;
+    for (let b = 0; b < beats; b += 1) {
+      const frames = beatFrames(cycleIndex * beats + b);
+      if (offset < frames) {
+        posFrac = (b + offset / frames) / beats;
+        break;
+      }
+      offset -= frames;
+    }
     return { cycleIndex, posFrac, framesPerCycle };
   };
 }
@@ -341,8 +413,21 @@ export function barsForFullPeriod(song) {
   return Math.max(1, Math.round(lcm / b));
 }
 
+// makeNoteFreq(song) -> midi note -> 16-bit frequency word. ADR 0006 D4: a
+// song may compute its note table at another clock (`target { pitch NTSC }`)
+// and shift it by `tuning CENTS`; without either this is registerMap.js's
+// PAL equal-tempered A=440 table itself, so no other song changes.
+function makeNoteFreq(song) {
+  const clock = song && song.noteClockHz > 0 ? song.noteClockHz : null;
+  const cents = song && Number.isFinite(song.tuningCents) ? song.tuningCents : 0;
+  if (clock === null && cents === 0) return noteToFreqRegister;
+  const clockHz = clock ?? DEFAULT_CPU_CLOCK_HZ;
+  return (midi) => Math.round((440 * 2 ** ((midi - 69) / 12 + cents / 1200) * 16777216) / clockHz) & 0xffff;
+}
+
 export function compile(song) {
   const resolveCycleClock = makeCycleClock(song);
+  const noteFreq = makeNoteFreq(song);
   // ADR 0002: `vib`'s rate is in Hz, so it (unlike everything else here,
   // which counts frames) needs to know how many frames a second holds.
   // Defaults to 50 for a song with no declared drive rate.
@@ -394,6 +479,20 @@ export function compile(song) {
     fxSr: null,
     fxWave: null,
     fxPw: null,
+    // ADR 0005 D1: tables started by fx wtab/atab/ptab/ftab, keyed by
+    // instrument table kind ({ table, loopIndex, start }, start = the frame
+    // the fx fired), replacing the instrument's own until the next onset.
+    tableOverride: {},
+    // ADR 0005 D3: fx pwm's current direction (+1 up, -1 down).
+    pwmDir: 1,
+    // ADR 0006: frames since the current note's own Hap began, counting a
+    // legato transition (tie, tp, slideTo) as a start, unlike
+    // framesSinceOnset. The gate length of a tied note counts from here.
+    framesSinceHapStart: 0,
+    // ADR 0006: the tone(s) last sounding, for a tie to continue, and the
+    // base tone an arp table keeps running from during a rest.
+    lastTones: null,
+    lastBaseTone: null,
   });
   const voiceRuntime = [makeVoiceRuntime(), makeVoiceRuntime(), makeVoiceRuntime()];
 
@@ -403,6 +502,11 @@ export function compile(song) {
   // voiceRuntime.
   let fxFilterCutoff = null;
   let fxMasterVolume = null;
+  // ADR 0005 D2: fx res/route/fmode/fctl, song-global and sticky like the two
+  // above, overriding the filter block's resonance, routing and mode nibbles.
+  let fxResonance = null;
+  let fxRouting = null;
+  let fxFilterMode = null;
 
   return function frameSource(frameIndex) {
     // shiftedFrame (and so cycleIndex) is negative during a startOffsetFrames
@@ -453,7 +557,23 @@ export function compile(song) {
       const base = voiceBase(v);
       const runtime = voiceRuntime[v];
 
-      const activeNotes = activeHapsAt(chain.notePattern, cycleIndex, posFrac);
+      let activeNotes = activeHapsAt(chain.notePattern, cycleIndex, posFrac);
+      // ADR 0006 D1: a tie Hap (a hold with nothing before it in its
+      // sequence) continues the tones that sounded on the previous frame, as
+      // a legato transition; with nothing sounding it is silence.
+      let tieActive = false;
+      if (activeNotes.length > 0 && activeNotes.some((h) => h.tie === true)) {
+        const notes = activeNotes.filter((h) => h.tie !== true);
+        if (notes.length > 0) {
+          activeNotes = notes;
+        } else if (runtime.activeKey !== null && runtime.lastTones) {
+          const tieHap = activeNotes[0];
+          activeNotes = runtime.lastTones.map((value) => ({ ...tieHap, value }));
+          tieActive = true;
+        } else {
+          activeNotes = [];
+        }
+      }
       const activeKey = activeKeyFor(activeNotes, cycleIndex);
 
       // --- fx lane sampling -------------------------------------------------
@@ -499,25 +619,32 @@ export function compile(song) {
       // transition legato like `gate legato`, which lets the instrument's
       // `slide TIME` glide (slideCfg below) carry across the boundary.
       const slideToActive = activeNotes.length === 1 && activeNotes[0].slideTo === true && isNewNote;
-      const suppressOnset = toneportaLegato || gateLegato || slideToActive;
+      const suppressOnset = toneportaLegato || gateLegato || slideToActive || (tieActive && isNewNote);
       const isOnset = isNewNote && !suppressOnset;
       // A rest keeps the table clock running: the last note's instrument
       // releases through its own tables, as in a tracker (see `inst` below).
       if (suppressOnset || activeKey === null) runtime.framesSinceOnset += 1;
       else runtime.framesSinceOnset = activeKey === runtime.activeKey ? runtime.framesSinceOnset + 1 : 0;
+      runtime.framesSinceHapStart = isNewNote ? 0 : runtime.framesSinceHapStart + 1;
       runtime.activeKey = activeKey;
+      if (activeNotes.length > 0) runtime.lastTones = activeNotes.map((h) => h.value);
 
       // One-shot "set a register" commands fire on the frame the fx hap
       // becomes active and stay in effect until the next note onset restores
       // the instrument's own values (in gplay.c, SETAD/SETSR poke the
       // registers at tick 0 and the next note's init writes the
       // instrument's AD/SR back).
+      // A pulse sweep (ADR 0005 D3) whose fx step began before this onset and
+      // is still active keeps its running value, so a sweep written across
+      // several notes stays one continuous ramp.
+      const pulseSweepContinues = fx != null && (fx.op === 'pws' || fx.op === 'pwm') && !fxIsNew;
       if (isOnset) {
         runtime.fxAd = null;
         runtime.fxSr = null;
         runtime.fxWave = null;
-        runtime.fxPw = null;
+        if (!pulseSweepContinues) runtime.fxPw = null;
         runtime.vibTime = 0;
+        runtime.tableOverride = {};
       }
       if (fxIsNew && fx) {
         if (fx.op === 'ad') runtime.fxAd = packAD(clampRound(fx.a.value, 0, 15), clampRound(fx.b.value, 0, 15));
@@ -531,6 +658,22 @@ export function compile(song) {
         else if (fx.op === 'fcut') fxFilterCutoff = clampRound(fx.a.value * 8, 0, 2047);
         else if (fx.op === 'vol') fxMasterVolume = clampRound(fx.a.value, 0, 15);
         else if (fx.op === 'vib') runtime.vibTime = 0;
+        else if (fx.op === 'res') fxResonance = fx.a.value & 0x0f;
+        else if (fx.op === 'route') fxRouting = fx.a.value & 0x0f;
+        else if (fx.op === 'fmode') fxFilterMode = fx.a.value & 0x0f;
+        else if (fx.op === 'fctl') {
+          fxResonance = fx.a.value & 0x0f;
+          fxRouting = fx.b.value & 0x0f;
+        } else if (fx.kind) {
+          runtime.tableOverride[fx.kind] = { table: fx.table, loopIndex: fx.loopIndex, start: frameIndex };
+        }
+      }
+      // ADR 0005 D3: fx fsw sweeps the shared cutoff on every frame of its
+      // step, in GoatTracker's 8-bit units with gplay.c's 8-bit wrap.
+      if (fx && fx.op === 'fsw') {
+        const base = fxFilterCutoff != null ? fxFilterCutoff : filterChain.cutoffPattern.queryAt(cycleIndex, posFrac);
+        const cutoff8 = clampRound(base / 8, 0, 255);
+        fxFilterCutoff = (((cutoff8 + fx.a.value) % 256) + 256) % 256 * 8;
       }
 
       // Chord reinterpretation: >1 simultaneously-active Hap round-robins
@@ -547,6 +690,8 @@ export function compile(song) {
         tone = activeNotes[arpeggioIndex].value;
         toneHap = activeNotes[arpeggioIndex];
       }
+
+      if (tone !== undefined) runtime.lastBaseTone = tone;
 
       // The attached instrument (see VoiceChain.inst()), or null. Its tables
       // are sampled by runtime.framesSinceOnset (the tracker clock), never
@@ -592,6 +737,18 @@ export function compile(song) {
         inst = chain.instrument;
       }
 
+      // An instrument table kind is running if an fx table op (ADR 0005 D1)
+      // started one or the instrument has its own; sampleKind() reads the
+      // override on its own clock (frames since the fx fired), else the
+      // instrument's table on the onset clock.
+      const tableOverride = runtime.tableOverride;
+      const hasTable = (kind) => tableOverride[kind] != null || !!(inst && inst[kind]);
+      const sampleKind = (kind) => {
+        const o = tableOverride[kind];
+        if (o) return sampleTable(o.table, frameIndex - o.start, o.loopIndex);
+        return sampleTable(inst[kind], runtime.framesSinceOnset, resolveLoopIndex(inst, kind), ...resolveSpeedDelay(inst, kind));
+      };
+
       // arp: a per-frame relative semitone offset added to the sounding tone
       // (the table-driven alternative to a "[c4,ef4,g4]" chord).
       //
@@ -601,8 +758,8 @@ export function compile(song) {
       // mix in one table: `arp 0 =36 0 12` is played note, fixed low C,
       // played note, octave up.
       let boundTone = tone;
-      if (inst && inst.arp && tone !== undefined) {
-        const arpOffset = sampleTable(inst.arp, runtime.framesSinceOnset, resolveLoopIndex(inst, 'arp'), ...resolveSpeedDelay(inst, 'arp'));
+      if (hasTable('arp') && tone !== undefined) {
+        const arpOffset = sampleKind('arp');
         if (typeof arpOffset === 'number') boundTone = tone + arpOffset;
         else if (arpOffset && typeof arpOffset === 'object' && typeof arpOffset.absNote === 'number') boundTone = arpOffset.absNote;
       }
@@ -627,8 +784,8 @@ export function compile(song) {
       let waveformBits;
       let waveformSourceStart = null;
       let waveformSourceEnd = null;
-      if (inst && inst.wave) {
-        waveformBits = waveformBitsFromValue(sampleTable(inst.wave, runtime.framesSinceOnset, resolveLoopIndex(inst, 'wave'), ...resolveSpeedDelay(inst, 'wave')));
+      if (hasTable('wave')) {
+        waveformBits = waveformBitsFromValue(sampleKind('wave'));
       } else {
         const activeWaveformHaps = activeHapsAt(chain.waveform, cycleIndex, posFrac);
         waveformBits =
@@ -643,29 +800,60 @@ export function compile(song) {
           waveformSourceEnd = waveformSourceEnd === null ? hap.sourceEnd : Math.max(waveformSourceEnd, hap.sourceEnd);
         }
       }
-      const attack = clampRound(chain.attack.queryAt(cycleIndex, posFrac), 0, 15);
-      const decay = clampRound(chain.decay.queryAt(cycleIndex, posFrac), 0, 15);
-      const sustain = clampRound(chain.sustain.queryAt(cycleIndex, posFrac), 0, 15);
-      const release = clampRound(chain.release.queryAt(cycleIndex, posFrac), 0, 15);
+      let attack = clampRound(chain.attack.queryAt(cycleIndex, posFrac), 0, 15);
+      let decay = clampRound(chain.decay.queryAt(cycleIndex, posFrac), 0, 15);
+      let sustain = clampRound(chain.sustain.queryAt(cycleIndex, posFrac), 0, 15);
+      let release = clampRound(chain.release.queryAt(cycleIndex, posFrac), 0, 15);
+      // ADR 0006 D2: a per-note instrument picked by `insts` brings its own
+      // envelope, as a tracker's instrument column does. (A voice with one
+      // instrument has it folded into the chain's patterns already.)
+      if (chain.instrumentPattern && inst && Array.isArray(inst.adsr)) {
+        [attack, decay, sustain, release] = inst.adsr.map((v) => clampRound(v, 0, 15));
+      }
       // Instrument table wins, chain value is the fallback (as for waveform).
       const pulseWidth =
-        inst && inst.pw
-          ? clampRound(sampleTable(inst.pw, runtime.framesSinceOnset, resolveLoopIndex(inst, 'pw'), ...resolveSpeedDelay(inst, 'pw')), 0, 4095, 2048)
+        hasTable('pw')
+          ? clampRound(sampleKind('pw'), 0, 4095, 2048)
           : clampRound(chain.pulseWidth.queryAt(cycleIndex, posFrac), 0, 4095, 2048);
+      // ADR 0005 D3: fx pws/pwm move the pulse width on every frame of their
+      // step, from whatever it holds now, unless a pw table is running (it
+      // would overwrite the register anyway, the same rule as pw.N).
+      if (fx && (fx.op === 'pws' || fx.op === 'pwm') && !hasTable('pw')) {
+        let current = runtime.fxPw != null ? runtime.fxPw : pulseWidth;
+        if (fx.op === 'pws') {
+          current = (((current + fx.a.value) % 4096) + 4096) % 4096;
+        } else {
+          const lo = fx.a.value;
+          const hi = fx.b.value;
+          if (fxIsNew) runtime.pwmDir = 1;
+          current = Math.max(lo, Math.min(hi, current)) + runtime.pwmDir * fx.c.value;
+          if (current >= hi) {
+            current = hi;
+            runtime.pwmDir = -1;
+          } else if (current <= lo) {
+            current = lo;
+            runtime.pwmDir = 1;
+          }
+        }
+        runtime.fxPw = current;
+      }
       const syncOn = !!chain.syncPattern.queryAt(cycleIndex, posFrac);
       const ringOn = !!chain.ringPattern.queryAt(cycleIndex, posFrac);
       // Test bit (control byte bit 3), same precedence.
-      const testOn =
+      let testOn =
         inst && inst.test
           ? !!sampleTable(inst.test, runtime.framesSinceOnset, resolveLoopIndex(inst, 'test'), ...resolveSpeedDelay(inst, 'test'))
           : !!chain.testPattern.queryAt(cycleIndex, posFrac);
       // The shared filter's cutoff as written by this instrument's
       // `filterTable`, resolved after the voice loop - see
       // filterTableWriteByVoice's declaration above.
-      if (inst && inst.filterTable) {
-        const written = sampleTable(inst.filterTable, runtime.framesSinceOnset, resolveLoopIndex(inst, 'filterTable'), ...resolveSpeedDelay(inst, 'filterTable'));
+      if (hasTable('filterTable')) {
+        const written = sampleKind('filterTable');
         if (typeof written === 'number') {
-          filterTableWriteByVoice[v] = { cutoff: written, framesSinceOnset: runtime.framesSinceOnset };
+          // An fx-started filter table (ADR 0005 D1) counts as started when
+          // it fired, for the most-recent-table-wins rule.
+          const started = tableOverride.filterTable ? frameIndex - tableOverride.filterTable.start : runtime.framesSinceOnset;
+          filterTableWriteByVoice[v] = { cutoff: written, framesSinceOnset: started };
         }
       }
       // Gate length. A value in 0..1 is the fraction of the current Hap's
@@ -708,14 +896,14 @@ export function compile(song) {
         // onset in runtime.slideFromFreqReg; the glide heads for the
         // per-frame (vib-inclusive) target.
         //
-        // With neither configured this is just noteToFreqRegister(tone).
+        // With neither configured this is just noteFreq(tone).
         const vibTriCfg = inst && inst.vibTri;
         const vibCfg = vibTriCfg ? null : inst && inst.vib;
         const slideCfg = inst && inst.slide;
         const vibOffsetSemitones = vibCfg
           ? vibCfg.depth * Math.sin(2 * Math.PI * vibCfg.rate * (runtime.framesSinceOnset / framesPerSecond))
           : 0;
-        const targetFreqReg = noteToFreqRegister(boundTone + vibOffsetSemitones);
+        const targetFreqReg = noteFreq(boundTone + vibOffsetSemitones);
 
         // vibTri: reproduces the behaviour of GoatTracker 2's instrument
         // vibrato (gplay.c, the CMD_DONOTHING path) rather than approximating
@@ -739,7 +927,7 @@ export function compile(song) {
           }
           if (runtime.framesSinceOnset >= vibTriCfg.delay) {
             const speed = vibTriCfg.speedShift !== undefined
-              ? Math.max(1, noteToFreqRegister(boundTone + 1) - noteToFreqRegister(boundTone)) >> vibTriCfg.speedShift
+              ? Math.max(1, noteFreq(boundTone + 1) - noteFreq(boundTone)) >> vibTriCfg.speedShift
               : vibTriCfg.speed;
             if (runtime.instVibTime < 0x80 && runtime.instVibTime > vibTriCfg.cmp) runtime.instVibTime ^= 0xff;
             runtime.instVibTime = (runtime.instVibTime + 0x02) & 0xff;
@@ -781,7 +969,7 @@ export function compile(song) {
             // semitone's worth of frequency at the current note, shifted
             // right by N". It depends on the note, so it is resolved here
             // (see rasterklang-dsl's fx.js parseParam).
-            const semitoneWidth = Math.max(1, noteToFreqRegister(boundTone + 1) - noteToFreqRegister(boundTone));
+            const semitoneWidth = Math.max(1, noteFreq(boundTone + 1) - noteFreq(boundTone));
             const resolveParam = (p) => (p.shift !== undefined ? semitoneWidth >> p.shift : p.value);
 
             if (op === 'pup') {
@@ -823,17 +1011,36 @@ export function compile(song) {
         const { lo, hi } = splitFreq(freqReg);
         target[base + 0] = lo;
         target[base + 1] = hi;
+      } else if (activeKey === null && runtime.lastBaseTone != null && hasTable('arp')) {
+        // ADR 0006 D3: in a rest the last instrument's arp table keeps
+        // running from the last note while the envelope releases, as its
+        // wave and pw tables already did (a tracker keeps executing its wave
+        // table after a key-off).
+        const arpOffset = sampleKind('arp');
+        let releaseTone;
+        if (typeof arpOffset === 'number') releaseTone = runtime.lastBaseTone + arpOffset;
+        else if (arpOffset && typeof arpOffset === 'object' && typeof arpOffset.absNote === 'number') releaseTone = arpOffset.absNote;
+        if (releaseTone !== undefined && Number.isFinite(releaseTone)) {
+          const freqReg = noteFreq(releaseTone);
+          runtime.lastFreqReg = freqReg;
+          const { lo, hi } = splitFreq(freqReg);
+          target[base + 0] = lo;
+          target[base + 1] = hi;
+        }
       }
 
       // fx `pw.N` overrides the pulse width only when the instrument has no
       // pw table, for the same reason as fx `wave.N` below: a running table
       // would overwrite it anyway. The override lasts until the next onset.
-      const effectivePulseWidth = runtime.fxPw != null && !(inst && inst.pw) ? runtime.fxPw : pulseWidth;
+      const effectivePulseWidth = runtime.fxPw != null && !hasTable('pw') ? runtime.fxPw : pulseWidth;
       const { lo: pwLo, hi: pwHi } = splitPulseWidth(effectivePulseWidth);
       target[base + 2] = pwLo;
       target[base + 3] = pwHi;
 
       let gate = tone !== undefined ? 1 : 0;
+      // ADR 0005 D4: true while a `hardRestart N` window that leads straight
+      // into another note is open, for the instrument's ad/sr/test clauses.
+      let hardRestartWindow = false;
       if (gate === 1 && inst && inst.gateTable) {
         // Per-frame gate-bit table, sampled like the other instrument tables.
         // Overrides the gate fraction entirely. Unlike a fraction it can turn
@@ -848,17 +1055,29 @@ export function compile(song) {
         // last N frames, so back-to-back notes of any length each get a gate
         // low->high edge that is visible at frame granularity (e.g. in a
         // .sid register dump), unlike the same-frame forced pair below.
+        // Counted from the note's own Hap start (ADR 0006 D2), so a note
+        // entered legato gets its own gate length instead of inheriting the
+        // frame count of the note it was tied from.
         const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
         const gateOffFrame = Math.max(1, framesInHap - gateReleaseFrames);
-        if (runtime.framesSinceOnset >= gateOffFrame) {
-          gate = 0;
+        if (runtime.framesSinceHapStart >= gateOffFrame) {
+          const next = nextNote(chain, cycleIndex, toneHap);
+          // No restart into a legato transition (a tie, tp, slideTo): it
+          // would retrigger the very note the tie says keeps sounding. With
+          // `hardRestart N beforeNotes` (ADR 0006 D5) no early release
+          // before a rest either: the note releases when the rest begins.
+          const skip = next.legato || (inst && inst.hardRestart && inst.hardRestart.beforeNotes && !next.follows);
+          if (!skip) {
+            gate = 0;
+            hardRestartWindow = !!(inst && inst.hardRestart) && next.follows;
+          }
         }
       } else if (gate === 1 && gateFraction < 1 && toneHap) {
         // Fractional form: the gate drops gateFraction of the way through
         // the Hap (its durFrac converted to frames).
         const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
         const gateOffFrame = Math.max(1, Math.floor(gateFraction * framesInHap));
-        if (runtime.framesSinceOnset >= gateOffFrame) {
+        if (runtime.framesSinceHapStart >= gateOffFrame) {
           gate = 0;
         }
       }
@@ -866,13 +1085,18 @@ export function compile(song) {
       // instrument has no wave table: in gplay.c the wave table runs after
       // the tick-0 command and would overwrite the value anyway.
       const effectiveWaveformBits =
-        runtime.fxWave != null && !(inst && inst.wave) ? runtime.fxWave & 0xf0 : waveformBits;
+        runtime.fxWave != null && !hasTable('wave') ? runtime.fxWave & 0xf0 : waveformBits;
+      if (hardRestartWindow && inst.hardRestart.test) testOn = true;
       const control = packControl({ waveform: effectiveWaveformBits, gate, sync: syncOn, ring: ringOn, test: testOn });
       target[base + 4] = control;
       // fx `ad.A.D` / `sr.S.R` (CMD_SETAD/CMD_SETSR) set the packed envelope
       // registers directly.
       target[base + 5] = runtime.fxAd != null ? runtime.fxAd : packAD(attack, decay);
       target[base + 6] = runtime.fxSr != null ? runtime.fxSr : packSR(sustain, release);
+      // The hard-restart envelope outranks an fx ad/sr override, as
+      // GoatTracker's hard restart writes over whatever the row set.
+      if (hardRestartWindow && inst.hardRestart.ad !== null) target[base + 5] = inst.hardRestart.ad;
+      if (hardRestartWindow && inst.hardRestart.sr !== null) target[base + 6] = inst.hardRestart.sr;
 
       if (isOnset) {
         forcedControl.set(base + 4, control & 0xfe);
@@ -924,9 +1148,14 @@ export function compile(song) {
     // whatever the cutoff, resonance and routing.
     let nowPlayingFilter;
     {
-      const resonance = clampRound(filterChain.resonancePattern.queryAt(cycleIndex, posFrac), 0, 15);
-      const modeObj = resolveModeObject(activeValuesAt(filterChain.modePattern, cycleIndex, posFrac));
-      const routing = filterChain.routingPattern.queryAt(cycleIndex, posFrac) || {};
+      // fx res/route/fmode/fctl (ADR 0005 D2) override the filter block.
+      const resonance = fxResonance != null ? fxResonance : clampRound(filterChain.resonancePattern.queryAt(cycleIndex, posFrac), 0, 15);
+      const modeObj = fxFilterMode != null
+        ? { lowpass: !!(fxFilterMode & 1), bandpass: !!(fxFilterMode & 2), highpass: !!(fxFilterMode & 4) }
+        : resolveModeObject(activeValuesAt(filterChain.modePattern, cycleIndex, posFrac));
+      const routing = fxRouting != null
+        ? { voice0: !!(fxRouting & 1), voice1: !!(fxRouting & 2), voice2: !!(fxRouting & 4) }
+        : filterChain.routingPattern.queryAt(cycleIndex, posFrac) || {};
 
       // Pick the winning filterTable write (see filterTableWriteByVoice):
       // most recent onset, ties to the higher voice index.
@@ -949,10 +1178,12 @@ export function compile(song) {
       const { lo: cutoffLo, hi: cutoffHi } = packCutoff(cutoffRaw);
       target[FILTER_REGISTERS.cutoffLo] = cutoffLo;
       target[FILTER_REGISTERS.cutoffHi] = cutoffHi;
-      target[FILTER_REGISTERS.resonanceRouting] = ((resonance & 0x0f) << 4) | (packFilterRouting(routing) & 0x07);
+      const routingBits = fxRouting != null ? fxRouting : packFilterRouting(routing) & 0x07;
+      target[FILTER_REGISTERS.resonanceRouting] = ((resonance & 0x0f) << 4) | routingBits;
       // fx `vol.N` (CMD_SETMASTERVOL) overrides the song's master volume.
       const effectiveVolume = fxMasterVolume != null ? fxMasterVolume : masterVolume;
-      target[FILTER_REGISTERS.modeVolume] = packFilterMode(modeObj) | (effectiveVolume & 0x0f);
+      const modeBits = fxFilterMode != null ? fxFilterMode << 4 : packFilterMode(modeObj);
+      target[FILTER_REGISTERS.modeVolume] = modeBits | (effectiveVolume & 0x0f);
 
       nowPlayingFilter = {
         cutoffRaw,

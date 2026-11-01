@@ -103,6 +103,10 @@ function pureWithSource(value, sourceStart, sourceEnd, extra) {
 // why this was chosen over the `fx` lane.
 const SLIDE_TO_PREFIX = 'slideTo:';
 
+// TIE (ADR 0006 D1) - the value of a leading-hold Hap. compile.js never
+// reads it as a pitch: it replaces a tie Hap with the tones sounding before.
+export const TIE = '_';
+
 // REF_NAME_RE - identifier shape after '$' inside mini-notation (ADR 0003
 // D5): same charset SIGIL uses at the grammar level.
 const REF_NAME_RE = /[a-zA-Z_][a-zA-Z0-9_]*/y;
@@ -375,6 +379,16 @@ class MiniParser {
       const start = this.pos;
       this.pos += 1;
       return this.tagRestsWithSource ? this.pure(REST, start, this.pos) : silence();
+    }
+    // A bare '_' only reaches this parser as a hold with nothing before it
+    // in its sequence (rasterklang-dsl's miniLength.js folds every other
+    // hold into the weight of the step it extends). ADR 0006 D1: it is a tie
+    // that continues whatever note sounds at that point, carried as a
+    // `tie: true` Hap tag the same way 'slideTo:' is.
+    if (ch === '_') {
+      const start = this.pos;
+      this.pos += 1;
+      return this.pure(TIE, start, this.pos, { tie: true });
     }
     if (ch === '[') return this.parseGroup();
     if (ch === '<') return this.parseAlternation();

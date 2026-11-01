@@ -284,6 +284,15 @@ export function song(tempoBPMOrPattern, options = {}) {
     // the song declares (6581, 8580), or null to leave the choice to the
     // exporter or live engine.
     chipModel = null,
+    // ADR 0005 D5 (rasterklang-dsl's
+    // docs/adr/0005-player-idioms-from-unitracker.md): frames per beat,
+    // cycled from the song's first beat ([6, 5] is GoatTracker funktempo),
+    // or null for uniform beats. Overrides the tempo for the cycle clock.
+    grooveFrames = null,
+    // ADR 0006 D4: the clock the note table is computed at (null = PAL, the
+    // table every song had before) and a shift in cents.
+    noteClockHz = null,
+    tuningCents = 0,
   } = options;
 
   // A Pattern or a mini-notation string means "varies per cycle"; anything
@@ -300,6 +309,9 @@ export function song(tempoBPMOrPattern, options = {}) {
     driveCycles,
     cpuClockHz,
     chipModel,
+    grooveFrames: Array.isArray(grooveFrames) && grooveFrames.length > 0 && grooveFrames.every((n) => Number.isInteger(n) && n > 0) ? grooveFrames : null,
+    noteClockHz: noteClockHz > 0 ? noteClockHz : null,
+    tuningCents: Number.isFinite(tuningCents) ? tuningCents : 0,
     voices: [undefined, undefined, undefined],
     filterChain: new FilterChain(),
 
