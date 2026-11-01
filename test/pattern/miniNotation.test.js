@@ -26,6 +26,26 @@ describe('note name parsing (SID-agnostic MIDI-equivalent numbers)', () => {
     expect(parseAtomValue('gs3')).toBe(56);
   });
 
+  it('b and f both spell a flat: eb3, ef3 -> 51; bb2 -> 46; ab1 -> 32', () => {
+    expect(parseAtomValue('eb3')).toBe(51);
+    expect(parseAtomValue('ef3')).toBe(51);
+    expect(parseAtomValue('bb2')).toBe(46);
+    expect(parseAtomValue('ab1')).toBe(32);
+    expect(parseAtomValue('db2')).toBe(37);
+    expect(parseAtomValue('b4')).toBe(71);
+  });
+
+  it('flats work in chords and slideTo targets', () => {
+    expect(sorted(parseMini('[f3,ab3,c4]'), 0).map((h) => h.value).sort((a, b) => a - b)).toEqual([53, 56, 60]);
+    expect(sorted(parseMini('c4 slideTo:eb4'), 0).map((h) => h.value)).toEqual([60, 63]);
+  });
+
+  it('rejects a note-like word with two accidentals instead of keeping it as a string', () => {
+    expect(() => parseMini('c4 cbb4')).toThrow(/'cbb4' at position 3 .* is not a note name/);
+    expect(() => parseMini('c##4')).toThrow(/not a note name/);
+    expect(() => parseMini('c4 slideTo:ebb4')).toThrow(/'ebb4'/);
+  });
+
   it('plain numbers stay numbers, plain words stay strings', () => {
     expect(parseAtomValue('200')).toBe(200);
     expect(parseAtomValue('2.75')).toBe(2.75);

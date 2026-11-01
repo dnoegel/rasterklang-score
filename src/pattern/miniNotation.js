@@ -52,14 +52,19 @@ import { seededRandom01 } from './prng.js';
 export const REST = Symbol('rest');
 
 const NOTE_LETTER_SEMITONE = { c: 0, d: 2, e: 4, f: 5, g: 7, a: 9, b: 11 };
-const NOTE_RE = /^([a-gA-G])([sf#]?)(-?\d+)$/;
+const NOTE_RE = /^([a-gA-G])([sfb#]?)(-?\d+)$/;
+// A word shaped like a note name with more than one accidental (cbb4, c##4,
+// ebs3). Not a note, and never a sensible instrument or sample name, so it
+// is rejected rather than silently kept as a string that plays no pitch.
+const NOTE_LIKE_RE = /^[a-gA-G][sfb#]{2,}-?\d+$/;
 const NUMBER_RE = /^-?\d+(\.\d+)?$/;
 
 // parseAtomValue(raw) - resolve one scanned atom token to a value.
 // - A bare number ("200", "-3", "2.75") becomes a JS number.
-// - A note name (c4, cs4, c#4, gs3, b4 ...) becomes its MIDI-equivalent
-//   number: (octave + 1) * 12 + semitone-from-C (+1 for s/#, -1 for f),
-//   e.g. g3 -> (3+1)*12 + 7 = 55.
+// - A note name (c4, cs4, c#4, gs3, b4, eb3, ef3 ...) becomes its
+//   MIDI-equivalent number: (octave + 1) * 12 + semitone-from-C (+1 for
+//   s/#, -1 for b/f), e.g. g3 -> (3+1)*12 + 7 = 55, bb2 -> 46. The letter
+//   comes first, so 'b' after it is always the flat sign (bb2 = B flat 2).
 // - Anything else (sample/word names like "bd") stays a plain string -
 //   this module doesn't know what a SID register or a sample is.
 export function parseAtomValue(raw) {
@@ -70,7 +75,7 @@ export function parseAtomValue(raw) {
     const [, letter, accidental, octaveStr] = m;
     let semitone = NOTE_LETTER_SEMITONE[letter.toLowerCase()];
     if (accidental === 's' || accidental === '#') semitone += 1;
-    if (accidental === 'f') semitone -= 1;
+    if (accidental === 'f' || accidental === 'b') semitone -= 1;
     const octave = Number(octaveStr);
     return (octave + 1) * 12 + semitone;
   }
@@ -403,6 +408,13 @@ class MiniParser {
     }
     const start = this.pos;
     const raw = this.scanWordToken();
+    const word = raw.startsWith(SLIDE_TO_PREFIX) ? raw.slice(SLIDE_TO_PREFIX.length) : raw;
+    if (NOTE_LIKE_RE.test(word)) {
+      throw new Error(
+        `'${word}' at position ${start} in mini-notation "${this.str}" is not a note name: ` +
+          'write one accidental (s or # for sharp, b or f for flat), e.g. eb3 or cs4',
+      );
+    }
     if (raw.startsWith(SLIDE_TO_PREFIX)) {
       const target = raw.slice(SLIDE_TO_PREFIX.length);
       if (target === '') throw new Error(`'slideTo:' needs a target note at position ${start} in mini-notation "${this.str}"`);
