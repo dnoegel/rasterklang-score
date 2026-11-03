@@ -180,6 +180,35 @@ function resolveVoiceAssignments(rawVoices) {
 
 export const DEFAULT_MASTER_VOLUME = 15;
 
+// Backported from 0.2.3 (DSL 4.3.0, 4.6.0, 4.7.0): what a `hardRestart N`
+// with clauses does. Instruments without clauses keep 0.1's gate -N.
+// presetRelease's frames before the gate closes (two PAL frames outlast the
+// longest rate-counter wrap of 32768 cycles) and how far a rest looks ahead
+// for a note whose `afterRests` window has begun.
+const PRESET_RELEASE_FRAMES = 2;
+const MAX_RESTART_LOOKAHEAD = 8;
+
+// nextNote(chain, cycleIndex, hap) -> { follows, legato } for what starts
+// right where `hap` ends (possibly in the next cycle): a note, and whether it
+// is entered without a retrigger (a slideTo tag or an fx tone portamento).
+function nextNote(chain, cycleIndex, hap) {
+  let pos = hap.startFrac + hap.durFrac;
+  let cycle = cycleIndex;
+  while (pos >= 1 - 1e-9) {
+    pos -= 1;
+    cycle += 1;
+  }
+  pos = Math.max(0, pos) + 1e-9;
+  const next = activeHapsAt(chain.notePattern, cycle, pos);
+  if (next.length === 0) return { follows: false, legato: false };
+  let legato = next.some((h) => h.slideTo === true);
+  if (!legato && chain.effectPattern) {
+    const fxNext = activeHapsAt(chain.effectPattern, cycle, pos);
+    legato = fxNext.length > 0 && fxNext[0].value != null && fxNext[0].value.op === 'tp';
+  }
+  return { follows: true, legato };
+}
+
 // sampleTable(table, framesSinceOnset, loopIndex, speed, delay) -> the table
 // entry active `framesSinceOnset` frames after this voice's current note
 // onset. Used for the instrument wave/arp/pw/filterTable/test/gate tables
@@ -394,6 +423,12 @@ export function compile(song) {
     fxSr: null,
     fxWave: null,
     fxPw: null,
+    // hard restart (backport): frames since the current note's Hap began,
+    // consecutive frames the gate has been open, and whether it closed
+    // within the current note already.
+    framesSinceHapStart: 0,
+    gateOpenFrames: 0,
+    gatePulsed: false,
   });
   const voiceRuntime = [makeVoiceRuntime(), makeVoiceRuntime(), makeVoiceRuntime()];
 
@@ -505,6 +540,7 @@ export function compile(song) {
       // releases through its own tables, as in a tracker (see `inst` below).
       if (suppressOnset || activeKey === null) runtime.framesSinceOnset += 1;
       else runtime.framesSinceOnset = activeKey === runtime.activeKey ? runtime.framesSinceOnset + 1 : 0;
+      runtime.framesSinceHapStart = isNewNote ? 0 : runtime.framesSinceHapStart + 1;
       runtime.activeKey = activeKey;
 
       // One-shot "set a register" commands fire on the frame the fx hap
@@ -655,7 +691,7 @@ export function compile(song) {
       const syncOn = !!chain.syncPattern.queryAt(cycleIndex, posFrac);
       const ringOn = !!chain.ringPattern.queryAt(cycleIndex, posFrac);
       // Test bit (control byte bit 3), same precedence.
-      const testOn =
+      let testOn =
         inst && inst.test
           ? !!sampleTable(inst.test, runtime.framesSinceOnset, resolveLoopIndex(inst, 'test'), ...resolveSpeedDelay(inst, 'test'))
           : !!chain.testPattern.queryAt(cycleIndex, posFrac);
@@ -833,33 +869,116 @@ export function compile(song) {
       target[base + 2] = pwLo;
       target[base + 3] = pwHi;
 
-      let gate = tone !== undefined ? 1 : 0;
-      if (gate === 1 && inst && inst.gateTable) {
-        // Per-frame gate-bit table, sampled like the other instrument tables.
-        // Overrides the gate fraction entirely. Unlike a fraction it can turn
-        // the gate back on mid-note (the tracker gate-in-wavetable trick for
-        // retriggering a percussive envelope without a new note). Such a
-        // 0->1 change differs from last frame's byte, so the normal register
-        // diff emits it without forcing.
-        const gateBit = sampleTable(inst.gateTable, runtime.framesSinceOnset, resolveLoopIndex(inst, 'gate'), ...resolveSpeedDelay(inst, 'gate'));
-        gate = gateBit ? 1 : 0;
-      } else if (gate === 1 && gateReleaseFrames !== null && toneHap) {
-        // Absolute-frames form (`gate -N`): the gate drops for the note's
-        // last N frames, so back-to-back notes of any length each get a gate
-        // low->high edge that is visible at frame granularity (e.g. in a
-        // .sid register dump), unlike the same-frame forced pair below.
-        const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
-        const gateOffFrame = Math.max(1, framesInHap - gateReleaseFrames);
-        if (runtime.framesSinceOnset >= gateOffFrame) {
-          gate = 0;
+      // gateAt(ahead) -> { gate, window } for the frame `ahead` frames from
+      // this one within the current note (0 = this frame). `window`: a
+      // `hardRestart N` window with clauses that leads straight into another
+      // note is open. Looking ahead (presetRelease) only asks whether the
+      // gate will have closed; past the note's end that is so before a rest.
+      const hardRestart = inst ? inst.hardRestart || null : null;
+      const gateAt = (ahead) => {
+        if (tone === undefined) return { gate: 0, window: false };
+        if (ahead > 0 && toneHap) {
+          const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+          if (runtime.framesSinceHapStart + ahead >= framesInHap) return { gate: nextNote(chain, cycleIndex, toneHap).follows ? 1 : 0, window: false };
         }
-      } else if (gate === 1 && gateFraction < 1 && toneHap) {
-        // Fractional form: the gate drops gateFraction of the way through
-        // the Hap (its durFrac converted to frames).
+        let gate = 1;
+        let window = false;
+        if (inst && inst.gateTable) {
+          // Per-frame gate-bit table, sampled like the other instrument tables.
+          // Overrides the gate fraction entirely. Unlike a fraction it can turn
+          // the gate back on mid-note (the tracker gate-in-wavetable trick for
+          // retriggering a percussive envelope without a new note). Such a
+          // 0->1 change differs from last frame's byte, so the normal register
+          // diff emits it without forcing.
+          const gateBit = sampleTable(inst.gateTable, runtime.framesSinceOnset + ahead, resolveLoopIndex(inst, 'gate'), ...resolveSpeedDelay(inst, 'gate'));
+          gate = gateBit ? 1 : 0;
+          // DSL 4.6.0 (backport): `hardRestart N` next to the table closes the
+          // gate for the note's last N frames before a following note.
+          if (inst.gateTableRestart && toneHap) {
+            const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+            const gateOffFrame = Math.max(1, framesInHap - inst.gateTableRestart);
+            if (runtime.framesSinceHapStart + ahead >= gateOffFrame) {
+              const next = nextNote(chain, cycleIndex, toneHap);
+              if (!(next.legato || (hardRestart && hardRestart.beforeNotes && !next.follows))) {
+                gate = 0;
+                window = !!hardRestart && next.follows;
+              }
+            }
+          }
+        } else if (gateReleaseFrames !== null && toneHap) {
+          // Absolute-frames form (`gate -N`): the gate drops for the note's
+          // last N frames, so back-to-back notes of any length each get a gate
+          // low->high edge that is visible at frame granularity (e.g. in a
+          // .sid register dump), unlike the same-frame forced pair below.
+          const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+          const gateOffFrame = Math.max(1, framesInHap - gateReleaseFrames);
+          if (hardRestart) {
+            // with clauses (backport): counted from the note's own Hap, no
+            // restart into a legato transition, `beforeNotes` honoured
+            if (runtime.framesSinceHapStart + ahead >= gateOffFrame) {
+              const next = nextNote(chain, cycleIndex, toneHap);
+              if (!(next.legato || (hardRestart.beforeNotes && !next.follows))) {
+                gate = 0;
+                window = next.follows;
+              }
+            }
+          } else if (runtime.framesSinceOnset + ahead >= gateOffFrame) {
+            gate = 0;
+          }
+        } else if (gateFraction < 1 && toneHap) {
+          // Fractional form: the gate drops gateFraction of the way through
+          // the Hap (its durFrac converted to frames).
+          const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+          const gateOffFrame = Math.max(1, Math.floor(gateFraction * framesInHap));
+          if (runtime.framesSinceOnset + ahead >= gateOffFrame) {
+            gate = 0;
+          }
+        }
+        return { gate, window };
+      };
+      // gateReopens(from) -> whether the gate opens again from `from` frames
+      // ahead to the end of the current note (a gate table pulsing it).
+      const gateReopens = (from) => {
+        if (!toneHap || !(inst && inst.gateTable)) return false;
         const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
-        const gateOffFrame = Math.max(1, Math.floor(gateFraction * framesInHap));
-        if (runtime.framesSinceOnset >= gateOffFrame) {
-          gate = 0;
+        for (let ahead = from; runtime.framesSinceHapStart + ahead < framesInHap; ahead += 1) if (gateAt(ahead).gate === 1) return true;
+        return false;
+      };
+      let { gate, window: hardRestartWindow } = gateAt(0);
+      // DSL 4.7.0 `hardRestart N afterRests` (backport): the window also
+      // opens in the last N frames of a rest before a note whose instrument
+      // has the clause, with that instrument's clauses.
+      let restartInst = hardRestartWindow ? inst : null;
+      if (tone === undefined) {
+        for (let ahead = 1; ahead <= MAX_RESTART_LOOKAHEAD; ahead += 1) {
+          const at = resolveCycleClock(shiftedFrame + ahead);
+          if (activeHapsAt(chain.notePattern, at.cycleIndex, at.posFrac).length === 0) continue;
+          let incoming = chain.instrument ?? null;
+          if (chain.instrumentPattern) {
+            const instHaps = activeHapsAt(chain.instrumentPattern, at.cycleIndex, at.posFrac);
+            if (instHaps.length > 0) incoming = instHaps[0].value;
+          }
+          const hr = incoming && incoming.hardRestart;
+          const frames = incoming ? incoming.gateTableRestart || (incoming.gate < 0 ? Math.round(-incoming.gate) : 0) : 0;
+          if (hr && hr.afterRests && ahead <= frames) {
+            hardRestartWindow = true;
+            restartInst = incoming;
+          }
+          break;
+        }
+      }
+      // DSL 4.7.0 `hardRestart N presetRelease` (backport): in the frames
+      // before the gate closes for good, a faster release is preset as the
+      // decay rate (see below).
+      runtime.gateOpenFrames = gate === 1 && !isOnset ? runtime.gateOpenFrames + 1 : gate;
+      if (isOnset) runtime.gatePulsed = false;
+      else if (gate === 0 && tone !== undefined) runtime.gatePulsed = true;
+      let presetRelease = false;
+      if (hardRestart && hardRestart.presetRelease && gate === 1 && !runtime.gatePulsed) {
+        for (let ahead = 1; ahead <= PRESET_RELEASE_FRAMES; ahead += 1) {
+          if (gateAt(ahead).gate !== 0) continue;
+          presetRelease = runtime.gateOpenFrames + ahead - 1 >= PRESET_RELEASE_FRAMES && !gateReopens(ahead + 1);
+          break;
         }
       }
       // fx `wave.N` (CMD_SETWAVE) overrides the waveform bits only when the
@@ -867,12 +986,24 @@ export function compile(song) {
       // the tick-0 command and would overwrite the value anyway.
       const effectiveWaveformBits =
         runtime.fxWave != null && !(inst && inst.wave) ? runtime.fxWave & 0xf0 : waveformBits;
+      if (hardRestartWindow && restartInst.hardRestart.test) testOn = true;
       const control = packControl({ waveform: effectiveWaveformBits, gate, sync: syncOn, ring: ringOn, test: testOn });
       target[base + 4] = control;
       // fx `ad.A.D` / `sr.S.R` (CMD_SETAD/CMD_SETSR) set the packed envelope
       // registers directly.
       target[base + 5] = runtime.fxAd != null ? runtime.fxAd : packAD(attack, decay);
       target[base + 6] = runtime.fxSr != null ? runtime.fxSr : packSR(sustain, release);
+      // The hard-restart envelope outranks an fx ad/sr override, as
+      // GoatTracker's hard restart writes over whatever the row set.
+      if (hardRestartWindow && restartInst.hardRestart.ad !== null) target[base + 5] = restartInst.hardRestart.ad;
+      if (hardRestartWindow && restartInst.hardRestart.sr !== null) target[base + 6] = restartInst.hardRestart.sr;
+      // The SID's envelope rate counter must count past its period before the
+      // envelope moves; a faster rate whose period it is already past makes
+      // it wrap first (up to 32768 cycles: the ADSR delay bug). Only a
+      // release faster than the decay can meet that.
+      if (presetRelease && (target[base + 6] & 0x0f) < (target[base + 5] & 0x0f)) {
+        target[base + 5] = (target[base + 5] & 0xf0) | (target[base + 6] & 0x0f);
+      }
 
       if (isOnset) {
         forcedControl.set(base + 4, control & 0xfe);
