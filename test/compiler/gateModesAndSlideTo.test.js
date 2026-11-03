@@ -233,3 +233,28 @@ voice 0 lead "${notes}"
     expect(() => compileDslV2Source(src('c4 slideTo:'))).toThrow(/slideTo/);
   });
 });
+
+describe('DSL 4.6.0: hardRestart next to a gate table', () => {
+  const src = (fields) => `speed 4 beats 4
+instrument hat
+  wave noise
+  adsr 0 0 7 6
+${fields.map((f) => `  ${f}`).join('\n')}
+end
+voice 0 hat "c4 c4 ~ c4"
+`;
+  const gates = (run) => run.states.map((s) => s[4] & 1);
+
+  it('the table runs and the last frame before a following note restarts', () => {
+    const run = runFrames(src(['gate 1!2 0', 'hardRestart 1 ad 0 0 sr 0 0']), 16);
+    expect(gates(run)).toEqual([1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0]);
+    expect(run.states.map((s) => s[6])).toEqual([0x76, 0x76, 0x76, 0x00, 0x76, 0x76, 0x76, 0x76, 0x76, 0x76, 0x76, 0x76, 0x76, 0x76, 0x76, 0x00]);
+  });
+
+  it('without the hardRestart the table alone is unchanged', () => {
+    // past its end an unlooped table leaves the gate open again
+    const run = runFrames(src(['gate 1!2 0']), 16);
+    expect(gates(run)).toEqual([1, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1]);
+    expect(run.states.every((s) => s[6] === 0x76)).toBe(true);
+  });
+});

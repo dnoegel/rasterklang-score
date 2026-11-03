@@ -1050,6 +1050,23 @@ export function compile(song) {
         // diff emits it without forcing.
         const gateBit = sampleTable(inst.gateTable, runtime.framesSinceOnset, resolveLoopIndex(inst, 'gate'), ...resolveSpeedDelay(inst, 'gate'));
         gate = gateBit ? 1 : 0;
+        // DSL 4.6.0: `hardRestart N` next to the table closes the gate for
+        // the note's last N frames before a following note and opens the
+        // hard-restart window, exactly as the `gate -N` branch below does;
+        // the table runs unchanged before that. Instruments without it are
+        // untouched (gateTableRestart is null).
+        if (inst.gateTableRestart && toneHap) {
+          const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+          const gateOffFrame = Math.max(1, framesInHap - inst.gateTableRestart);
+          if (runtime.framesSinceHapStart >= gateOffFrame) {
+            const next = nextNote(chain, cycleIndex, toneHap);
+            const skip = next.legato || (inst.hardRestart && inst.hardRestart.beforeNotes && !next.follows);
+            if (!skip) {
+              gate = 0;
+              hardRestartWindow = !!inst.hardRestart && next.follows;
+            }
+          }
+        }
       } else if (gate === 1 && gateReleaseFrames !== null && toneHap) {
         // Absolute-frames form (`gate -N`): the gate drops for the note's
         // last N frames, so back-to-back notes of any length each get a gate
