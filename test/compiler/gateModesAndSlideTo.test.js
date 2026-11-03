@@ -258,3 +258,26 @@ voice 0 hat "c4 c4 ~ c4"
     expect(run.states.every((s) => s[6] === 0x76)).toBe(true);
   });
 });
+
+describe('DSL 4.7.0: hardRestart afterRests and presetRelease', () => {
+  const src = (fields, notes) => `speed 4 beats 4
+instrument lead
+  wave pulse
+  adsr 0 9 8 0
+${fields.map((f) => `  ${f}`).join('\n')}
+end
+voice 0 lead "${notes}"
+`;
+  const reg = (run, r) => run.states.map((s) => s[r]);
+
+  it('afterRests restarts at the end of a rest before a note', () => {
+    const run = runFrames(src(['hardRestart 1 ad 0 0 sr 0 0 afterRests'], 'c4 ~ e4 ~'), 8);
+    expect(reg(run, 6)).toEqual([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00]);
+  });
+
+  it('presetRelease presets a faster release as decay before the gate closes', () => {
+    const run = runFrames(src(['hardRestart 1 presetRelease'], 'c4 e4 g4 c5'), 4);
+    expect(reg(run, 5)).toEqual([0x09, 0x00, 0x00, 0x09]);
+    expect(reg(run, 4).map((c) => c & 1)).toEqual([1, 1, 1, 0]);
+  });
+});
