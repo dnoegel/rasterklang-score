@@ -187,6 +187,10 @@ const PRESET_RELEASE_FRAMES = 2;
 // How far a rest looks ahead for a note whose `hardRestart N afterRests`
 // window has begun (N larger than this never opens early in a rest).
 const MAX_RESTART_LOOKAHEAD = 8;
+// How far a note looks ahead for its own end (exact restart placement);
+// a note ending later than this is far from any restart window.
+const NOTE_END_LOOKAHEAD = 16;
+const NOTE_END_FAR = 1000;
 
 // nextNote(chain, cycleIndex, hap) -> { follows, legato } for what starts
 // right where `hap` ends (possibly in the next cycle). `follows`: a note (ADR
@@ -1055,11 +1059,37 @@ export function compile(song) {
       // into another note is open, for the instrument's ad/sr/test clauses.
       // Looking ahead (DSL 4.7.0 `presetRelease`) only asks whether the gate
       // will have closed; past the note's end that is so before a rest.
+      // DSL 4.7.0 instruments (`afterRests`/`presetRelease`) place their
+      // restart by the frames the note really gets, found by looking ahead
+      // with the clock that starts notes: the note's share of the cycle in
+      // frames is only an estimate, and where a step boundary falls between
+      // frames the note can start a frame late and the restart window would
+      // land on the next note. Older instruments keep the estimate, so their
+      // songs compile as before.
+      const exactRestart = !!(inst && inst.hardRestart && (inst.hardRestart.afterRests || inst.hardRestart.presetRelease));
+      let framesLeftCache;
+      const framesLeft = () => {
+        if (framesLeftCache === undefined) {
+          framesLeftCache = NOTE_END_FAR;
+          for (let k = 1; k <= NOTE_END_LOOKAHEAD; k += 1) {
+            // the note ends where the sounding notes change, the same test
+            // that starts a note (isNewNote), so float edges agree with it
+            const at = resolveCycleClock(shiftedFrame + k);
+            if (activeKeyFor(activeHapsAt(chain.notePattern, at.cycleIndex, at.posFrac), at.cycleIndex) !== runtime.activeKey) {
+              framesLeftCache = k;
+              break;
+            }
+          }
+        }
+        return framesLeftCache;
+      };
+      // hapFrames() -> the current note's length in frames
+      const hapFrames = () => (exactRestart ? runtime.framesSinceHapStart + framesLeft() : Math.max(1, Math.round(toneHap.durFrac * framesPerCycle)));
       const gateAt = (ahead) => {
         if (tone === undefined) return { gate: 0, window: false };
         const sinceHapStart = runtime.framesSinceHapStart + ahead;
         if (ahead > 0 && toneHap) {
-          const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+          const framesInHap = hapFrames();
           if (sinceHapStart >= framesInHap) return { gate: nextNote(chain, cycleIndex, toneHap).follows ? 1 : 0, window: false };
         }
         let gate = 1;
@@ -1079,7 +1109,7 @@ export function compile(song) {
           // the table runs unchanged before that. Instruments without it are
           // untouched (gateTableRestart is null).
           if (inst.gateTableRestart && toneHap) {
-            const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+            const framesInHap = hapFrames();
             const gateOffFrame = Math.max(1, framesInHap - inst.gateTableRestart);
             if (sinceHapStart >= gateOffFrame) {
               const next = nextNote(chain, cycleIndex, toneHap);
@@ -1098,7 +1128,7 @@ export function compile(song) {
           // Counted from the note's own Hap start (ADR 0006 D2), so a note
           // entered legato gets its own gate length instead of inheriting the
           // frame count of the note it was tied from.
-          const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+          const framesInHap = hapFrames();
           const gateOffFrame = Math.max(1, framesInHap - gateReleaseFrames);
           if (sinceHapStart >= gateOffFrame) {
             const next = nextNote(chain, cycleIndex, toneHap);
@@ -1127,7 +1157,7 @@ export function compile(song) {
       // ahead to the end of the current note (a gate table pulsing it).
       const gateReopens = (from) => {
         if (!toneHap || !(inst && inst.gateTable)) return false;
-        const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+        const framesInHap = hapFrames();
         for (let ahead = from; runtime.framesSinceHapStart + ahead < framesInHap; ahead += 1) if (gateAt(ahead).gate === 1) return true;
         return false;
       };
