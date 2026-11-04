@@ -187,6 +187,9 @@ export const DEFAULT_MASTER_VOLUME = 15;
 // for a note whose `afterRests` window has begun.
 const PRESET_RELEASE_FRAMES = 2;
 const MAX_RESTART_LOOKAHEAD = 8;
+// How far a note looks ahead for its own end (exact restart placement).
+const NOTE_END_LOOKAHEAD = 16;
+const NOTE_END_FAR = 1000;
 
 // nextNote(chain, cycleIndex, hap) -> { follows, legato } for what starts
 // right where `hap` ends (possibly in the next cycle): a note, and whether it
@@ -875,10 +878,32 @@ export function compile(song) {
       // note is open. Looking ahead (presetRelease) only asks whether the
       // gate will have closed; past the note's end that is so before a rest.
       const hardRestart = inst ? inst.hardRestart || null : null;
+      // 4.7.0 instruments (`afterRests`/`presetRelease`) place their restart
+      // by the frames the note really gets: the note ends where the sounding
+      // notes change (the test that starts notes), found by looking ahead.
+      // The note's share of the cycle in frames is only an estimate; where a
+      // step boundary falls between frames the window would land on the next
+      // note. Other instruments keep the estimate.
+      const exactRestart = !!(hardRestart && (hardRestart.afterRests || hardRestart.presetRelease));
+      let framesLeftCache;
+      const framesLeft = () => {
+        if (framesLeftCache === undefined) {
+          framesLeftCache = NOTE_END_FAR;
+          for (let k = 1; k <= NOTE_END_LOOKAHEAD; k += 1) {
+            const at = resolveCycleClock(shiftedFrame + k);
+            if (activeKeyFor(activeHapsAt(chain.notePattern, at.cycleIndex, at.posFrac), at.cycleIndex) !== runtime.activeKey) {
+              framesLeftCache = k;
+              break;
+            }
+          }
+        }
+        return framesLeftCache;
+      };
+      const hapFrames = () => (exactRestart ? runtime.framesSinceHapStart + framesLeft() : Math.max(1, Math.round(toneHap.durFrac * framesPerCycle)));
       const gateAt = (ahead) => {
         if (tone === undefined) return { gate: 0, window: false };
         if (ahead > 0 && toneHap) {
-          const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+          const framesInHap = hapFrames();
           if (runtime.framesSinceHapStart + ahead >= framesInHap) return { gate: nextNote(chain, cycleIndex, toneHap).follows ? 1 : 0, window: false };
         }
         let gate = 1;
@@ -895,7 +920,7 @@ export function compile(song) {
           // DSL 4.6.0 (backport): `hardRestart N` next to the table closes the
           // gate for the note's last N frames before a following note.
           if (inst.gateTableRestart && toneHap) {
-            const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+            const framesInHap = hapFrames();
             const gateOffFrame = Math.max(1, framesInHap - inst.gateTableRestart);
             if (runtime.framesSinceHapStart + ahead >= gateOffFrame) {
               const next = nextNote(chain, cycleIndex, toneHap);
@@ -915,7 +940,7 @@ export function compile(song) {
           if (hardRestart) {
             // with clauses (backport): counted from the note's own Hap, no
             // restart into a legato transition, `beforeNotes` honoured
-            if (runtime.framesSinceHapStart + ahead >= gateOffFrame) {
+            if (runtime.framesSinceHapStart + ahead >= Math.max(1, hapFrames() - gateReleaseFrames)) {
               const next = nextNote(chain, cycleIndex, toneHap);
               if (!(next.legato || (hardRestart.beforeNotes && !next.follows))) {
                 gate = 0;
@@ -940,7 +965,7 @@ export function compile(song) {
       // ahead to the end of the current note (a gate table pulsing it).
       const gateReopens = (from) => {
         if (!toneHap || !(inst && inst.gateTable)) return false;
-        const framesInHap = Math.max(1, Math.round(toneHap.durFrac * framesPerCycle));
+        const framesInHap = hapFrames();
         for (let ahead = from; runtime.framesSinceHapStart + ahead < framesInHap; ahead += 1) if (gateAt(ahead).gate === 1) return true;
         return false;
       };

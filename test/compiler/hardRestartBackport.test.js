@@ -1,6 +1,6 @@
 // Backport (0.1.4) of rasterklang-dsl's test/dsl/gateTableHardRestart.test.js,
-// DSL 4.6.0 and 4.7.0: a gate table plus `hardRestart N` (or `gate -N`). The
-// table runs as before; in the note's last N frames before a following note the gate
+// DSL 4.6.0 and 4.7.0: a gate table plus `hardRestart N` (or `gate -N`). The table runs
+// as before; in the note's last N frames before a following note the gate
 // closes and the hard-restart clauses are written, exactly as `hardRestart N`
 // does on an instrument without a table. Assertions are on the register state
 // per frame, as in playerIdioms2.test.js.
@@ -175,5 +175,30 @@ describe('presetRelease and a pulsing gate table', () => {
     const frames = registerFrames(src, 8);
     expect(frames.map(gate)).toEqual([1, 0, 1, 1, 1, 1, 1, 0]);
     expect(frames.every((f) => ad(f) === 0x09)).toBe(true);
+  });
+});
+
+describe('4.7.0 restarts land on the frames a note really gets', () => {
+  // 6/8 at speed 8: twelve 4-frame steps per bar, where floating-point step
+  // boundaries can start a note a frame late; the restart must still come in
+  // the frame before every following note.
+  it('restarts before every note of a 6/8 bar', () => {
+    const src = `speed 8 meter 6/8
+instrument hat
+  wave noise
+  adsr 0 0 7 4
+  gate 1!2 0
+  hardRestart 1 ad 0 0 sr 0 0 afterRests presetRelease
+end
+voice 0 hat "c4 c4 c4 c4 c4 c4 c4 c4 c4 c4 c4 c4"
+`;
+    const frames = registerFrames(src, 48 * 4 + 1);
+    let onsets = 0;
+    for (let i = 1; i < frames.length; i += 1) {
+      if (!(gate(frames[i]) && !gate(frames[i - 1]))) continue;
+      onsets += 1;
+      expect([i, sr(frames[i - 1])]).toEqual([i, 0]);
+    }
+    expect(onsets).toBe(48);
   });
 });
