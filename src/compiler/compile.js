@@ -999,15 +999,10 @@ export function compile(song) {
       if (isOnset) runtime.gatePulsed = false;
       else if (gate === 0 && tone !== undefined) runtime.gatePulsed = true;
       let presetRelease = false;
-      // the release the gate will close with: a restart window's own `sr`
-      // when the gate closes into one, else the instrument's
-      let releaseAtClose = null;
       if (hardRestart && hardRestart.presetRelease && gate === 1 && !runtime.gatePulsed) {
         for (let ahead = 1; ahead <= PRESET_RELEASE_FRAMES; ahead += 1) {
-          const at = gateAt(ahead);
-          if (at.gate !== 0) continue;
+          if (gateAt(ahead).gate !== 0) continue;
           presetRelease = runtime.gateOpenFrames + ahead - 1 >= PRESET_RELEASE_FRAMES && !gateReopens(ahead + 1);
-          if (at.window && hardRestart.sr !== null) releaseAtClose = hardRestart.sr & 0x0f;
           break;
         }
       }
@@ -1031,11 +1026,8 @@ export function compile(song) {
       // envelope moves; a faster rate whose period it is already past makes
       // it wrap first (up to 32768 cycles: the ADSR delay bug). Only a
       // release faster than the decay can meet that.
-      // Preset the release the gate will really close with (before a
-      // restart, the restart's own).
-      const releaseNibble = releaseAtClose !== null ? releaseAtClose : target[base + 6] & 0x0f;
-      if (presetRelease && releaseNibble < (target[base + 5] & 0x0f)) {
-        target[base + 5] = (target[base + 5] & 0xf0) | releaseNibble;
+      if (presetRelease && (target[base + 6] & 0x0f) < (target[base + 5] & 0x0f)) {
+        target[base + 5] = (target[base + 5] & 0xf0) | (target[base + 6] & 0x0f);
       }
 
       if (isOnset) {
