@@ -202,3 +202,14 @@ voice 0 hat "c4 c4 c4 c4 c4 c4 c4 c4 c4 c4 c4 c4"
     expect(onsets).toBe(48);
   });
 });
+
+describe('presetRelease before a restart', () => {
+  it('presets the release the restart closes with, not the instrument one', () => {
+    // decay 7, release 3; the restart window writes sr 0 0, so the gate
+    // closes with release 0, and that is what the two frames before preset
+    const src = song(['hardRestart 1 ad 0 0 sr 0 0 presetRelease'], 'c4 e4 g4 c5').replace('adsr 1 2 3 4', 'adsr 0 7 5 3');
+    const frames = registerFrames(src, 4);
+    expect(frames.map(ad)).toEqual([0x07, 0x00, 0x00, 0x00]);
+    expect(frames.map(sr)).toEqual([0x53, 0x53, 0x53, 0x00]);
+  });
+});
