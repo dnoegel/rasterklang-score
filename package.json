@@ -1,6 +1,6 @@
 {
   "name": "rasterklang-score",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Pattern engine, compiler and exporters turning rasterklang songs into C64 SID register writes (research project)",
   "license": "MIT",
   "author": "Daniel Nögel",
