@@ -1195,10 +1195,15 @@ export function compile(song) {
       if (isOnset) runtime.gatePulsed = false;
       else if (gate === 0 && tone !== undefined) runtime.gatePulsed = true;
       let presetRelease = false;
+      // the release the gate will close with: a restart window's own `sr`
+      // when the gate closes into one, else the instrument's
+      let releaseAtClose = null;
       if (inst && inst.hardRestart && inst.hardRestart.presetRelease && gate === 1 && !runtime.gatePulsed) {
         for (let ahead = 1; ahead <= PRESET_RELEASE_FRAMES; ahead += 1) {
-          if (gateAt(ahead).gate !== 0) continue;
+          const at = gateAt(ahead);
+          if (at.gate !== 0) continue;
           presetRelease = runtime.gateOpenFrames + ahead - 1 >= PRESET_RELEASE_FRAMES && !gateReopens(ahead + 1);
+          if (at.window && inst.hardRestart.sr !== null) releaseAtClose = inst.hardRestart.sr & 0x0f;
           break;
         }
       }
@@ -1225,8 +1230,12 @@ export function compile(song) {
       // the counter wraps while the envelope holds its sustain level.
       // Only a release faster than the decay can find the counter past its
       // period, so a slower one is left alone (it would slow the decay).
-      if (presetRelease && (target[base + 6] & 0x0f) < (target[base + 5] & 0x0f)) {
-        target[base + 5] = (target[base + 5] & 0xf0) | (target[base + 6] & 0x0f);
+      // Preset the release the gate will really close with: before a restart
+      // that is the restart's own release, and presetting the instrument's
+      // instead would make the switch to it wrap the counter after all.
+      const releaseNibble = releaseAtClose !== null ? releaseAtClose : target[base + 6] & 0x0f;
+      if (presetRelease && releaseNibble < (target[base + 5] & 0x0f)) {
+        target[base + 5] = (target[base + 5] & 0xf0) | releaseNibble;
       }
       if (hardRestartWindow && restartInst.hardRestart.sr !== null) target[base + 6] = restartInst.hardRestart.sr;
 
